@@ -1,13 +1,8 @@
-"""Host RAM per env + where the 64K PhysX material ceiling sits.
+"""Host RAM per env and physics materials per env.
 
-Customer: a single 8-GPU node with 2 TB RAM gets its process killed at ~500K envs (host RAM, not VRAM), and one
-PhysX process caps out at 64K materials. memory_sweep.py measures VRAM. Here each point is one fresh SimWorker
-(OmniReset peg task, original reset-data path), all points in parallel, one per
-healthy GPU node (each process has its own node, so RSS is per process and node RAM is not shared).
-
-Per point: actor RSS / high-water mark after init and after stepping, RSS split (anon / file / shmem), node RAM,
-VRAM, USD physics-material prims per env. 24,576 envs sits between the last good (16,384) and the crash (32,768)
-point of the VRAM sweep: it bounds the per-process material ceiling.
+Each point is one fresh SimWorker (OmniReset peg task, original reset-data path). Points run in parallel, one per GPU
+node, so RSS is per process. Per point: actor RSS / high-water mark after init and after stepping, RSS split
+(anon / file / shmem), node RAM, VRAM, USD physics-material prims per env.
 
 Output: host_ram.json with RSS = a + b*N fit and extrapolations (500K and 1M envs; per node of 8 processes).
 """

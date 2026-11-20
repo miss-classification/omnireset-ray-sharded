@@ -1,4 +1,4 @@
-"""Driver-side training loop shared by Phases 4-6: W SimWorkers + 1 Learner, pipelined rollouts, fault handling.
+"""Driver-side training loop: W SimWorkers + 1 Learner, pipelined rollouts, fault handling.
 
 Driver does orchestration + logging only (ray + stdlib; no isaac, numpy or torch on the head).
 

@@ -53,7 +53,7 @@ def main():
     for r in pending:
         print(f"{refs[r]['NodeManagerHostname'][:24]:<24} no answer within 120s")
     for n in excluded:
-        print(f"{n['NodeManagerHostname'][:24]:<24} excluded (broken node, cannot run checks)")
+        print(f"{n['NodeManagerHostname'][:24]:<24} excluded (EXCLUDE_NODE_ID_PREFIXES)")
 
     # 3. what Ray still has allocated
     total, avail = ray.cluster_resources(), ray.available_resources()

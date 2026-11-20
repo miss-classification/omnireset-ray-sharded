@@ -135,9 +135,9 @@ def main():
     nodes = [n["NodeID"] for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0) >= 1 and n["NodeID"] not in bad]
     jobs = {}
     if args.only in (None, "mps"):
-        jobs["mps"] = lambda: run_mps(nodes[2], args.envs, args.k)
+        jobs["mps"] = lambda: run_mps(nodes[0], args.envs, args.k)
     if args.only in (None, "overlap"):
-        jobs["overlap"] = lambda: run_overlap(nodes[3], args.envs)
+        jobs["overlap"] = lambda: run_overlap(nodes[-1], args.envs)  # with one GPU node, run --only mps / --only overlap separately
     with cf.ThreadPoolExecutor(len(jobs)) as ex:
         futs = {k: ex.submit(f) for k, f in jobs.items()}
         res = {k: f.result() for k, f in futs.items()}

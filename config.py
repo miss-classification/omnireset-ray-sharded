@@ -3,18 +3,18 @@ import os
 
 # ---- cluster ----
 RAY_ADDRESS = "auto"
-NUM_GPUS_EXPECTED = 8          # GPUs Phase 0 expects to find
-NUM_WORKERS = 6                # W: SimWorker actors (1 GPU each). 6 while 2 nodes are broken (see EXCLUDE_NODE_IDS)
+NUM_GPUS_EXPECTED = 8          # GPUs check_gpus.py expects to find
+NUM_WORKERS = 6                # simulators (SimWorker actors), 1 GPU each by default
 
 # Nodes Ray must not schedule onto (exclusion, not pinning), e.g. nodes whose Ray workers cannot start.
 EXCLUDE_NODE_ID_PREFIXES = []  # node-id prefixes to keep work off (e.g. unhealthy nodes)
 
 # ---- paths ----
 STORAGE = "/mnt/cluster_storage"
-RESULTS_DIR = os.path.join(STORAGE, "demo_results")
-CKPT_DIR = os.path.join(STORAGE, "demo_ckpts")
+RESULTS_DIR = os.path.join(STORAGE, "omnireset_results")
+CKPT_DIR = os.path.join(STORAGE, "omnireset_ckpts")
 BANK_DIR = os.path.join(RESULTS_DIR, "reset_bank")
-KIT_CACHE_DIR = "/tmp/kit_cache"  # node-local; was /mnt/cluster_storage/kit_cache (shared NFS) before 2026-11-19 23:00
+KIT_CACHE_DIR = "/tmp/kit_cache"  # node-local Kit cache
 
 # ---- Isaac process env (not set in the workspace image; passed to every sim actor) ----
 ISAAC_ENV_VARS = {
@@ -46,7 +46,7 @@ BANK_SIZE = None               # None = all released OmniReset states (Peg__PegH
 BANK_PAIR = "Peg__PegHole"     # reset-bank partition matching TASK_OVERRIDES
 SGS_EVERY = 1                  # learner recomputes + broadcasts SGS weights every K updates
 CKPT_EVERY = 10                # learner checkpoint every K updates -> CKPT_DIR/<run tag>/
-ENVS_PER_GPU = 16384           # Phase 2: last good point below PhysX's 64K-material crash at 32,768 (VRAM 23%)
+ENVS_PER_GPU = 16384           # envs per simulator; the peg task allows at most 32,767 (PhysX 64K materials)
 PAPER_ENVS_PER_GPU = 4000      # AlphaNIST reference density
 OMNIRESET_TOTAL_ENVS = 65536   # OmniReset scales PPO to 64K+ envs
 

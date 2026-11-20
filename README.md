@@ -1,60 +1,111 @@
 # omnireset-ray-sharded
 
-Isaac Lab simulation sharded across GPUs with Ray: one Isaac Sim process per GPU (a Ray actor), one PPO learner
-actor, reset states served from a Ray Data bank, per-reset-state success-guided sampling, and automatic restart of
-failed simulators. Tested with the OmniReset peg-insertion task (UR5e + Robotiq 2F-85) on A100-80GB GPUs.
+Run Isaac Lab reinforcement learning across many GPUs with Ray. Each GPU runs its own Isaac Sim simulator as a Ray
+actor; one PPO learner trains on rollouts from all of them. Example task: OmniReset peg insertion
+(UR5e + Robotiq 2F-85).
 
-## Results (A100-80GB, PhysX TGS)
+![98,304 robots inserting pegs on 6 GPUs](docs/expert_at_scale.gif)
 
-| Setup | Startup | Training speed |
+## What it does
+
+- **Faster startup.** Simulators start in parallel. Smaller simulators start faster, so splitting envs across
+  simulators cuts time to the first training step.
+- **One GPU, several simulators.** With NVIDIA MPS, several simulators share one GPU at full training speed.
+- **More GPUs, more envs.** Add GPUs to add simulators. Each simulator has its own PhysX 64K-materials budget and
+  its own host memory.
+- **Restarts.** A failed simulator restarts and rejoins while training continues.
+- **Fast reset data.** Ray Data converts reset states into small per-simulator files once; each simulator loads
+  only its share.
+
+## Measured (A100-80GB, PhysX TGS, 16,384 envs per GPU unless noted)
+
+| Setup | Time to first step | Training speed |
 |---|---:|---:|
-| 1 GPU, 1 simulator x 16,384 envs | 8.9 min | 18.7K env-steps/s |
-| 1 GPU, 4 simulators x 4,096 with NVIDIA MPS | 3.6 min | 19.3K env-steps/s |
-| 4 GPUs, 4 simulators x 4,096 | 2.5 min | |
-| 5 GPUs, 5 x 16,384 = 81,920 envs | 9.4 min | 101K env-steps/s (96% of linear) |
+| 1 GPU, 4 simulators x 4,096 envs, MPS | 3.6 min | 19.3K env-steps/s |
+| 4 GPUs, 4 simulators x 4,096 envs | 2.5 min | |
+| 5 GPUs, 81,920 envs | 9.4 min | 101K env-steps/s |
 
-## Stack
+Scaling from 1 to 5 GPUs: 96% of linear.
 
-Isaac Sim 6.1.0.0, Isaac Lab 3.0 (ae37b02), UWLab 2.0 (2b40afb, OmniReset), UW rsl_rl 5.4.1, torch 2.11 cu128,
-Ray 2.60, Python 3.12. Exact Python packages: `image/lockfile.txt`.
+## Requirements
+
+- A Ray cluster with GPU nodes (tested on Anyscale, Ray 2.60, Python 3.12).
+- Isaac Sim 6.1.0.0, Isaac Lab 3.0 (ae37b02), UWLab 2.0 (2b40afb), UW rsl_rl 5.4.1, torch 2.11 cu128.
+  Build the image in `image/`:
+
+```
+cd image
+python make_containerfile.py
+anyscale image build -n omnireset-ray-sharded -f Containerfile.isaac
+```
+
+- Shared storage at `/mnt/cluster_storage` (change `STORAGE` in `config.py` for another path).
+
+## Quick start
+
+```
+python check_gpus.py                 # one task per GPU: checks every GPU is reachable
+python build_reset_bank.py           # reset states -> per-simulator files (Ray Data)
+python scale_training.py --smoke     # 2 simulators x 1,024 envs, 3 training iterations
+python teardown.py                   # stop everything, check for leftover Isaac processes
+```
+
+## Single GPU
+
+```
+python one_gpu.py --only mps --envs 16384 --k 4     # 4 simulators x 4,096 envs sharing one GPU with MPS
+python one_gpu.py --only overlap --envs 16384       # next run starts while the current one trains
+```
+
+`one_gpu.py` starts the MPS daemon on the node with a Ray task and stops it at the end. Each simulator needs about
+11 GB of GPU memory before envs are added; size `--k` to the GPU.
+
+## Multiple GPUs
+
+```
+python scale_training.py --ws 1 2 4 --envs 16384    # training at 1, 2 and 4 GPUs
+python learner_placement.py                         # learner on its own GPU vs sharing a simulator's GPU
+python fault_tolerance.py                           # stop one simulator mid-run; it restarts and rejoins
+```
+
+## Sizing
+
+```
+python memory_sweep.py           # GPU memory and speed vs envs per simulator
+python startup_and_memory.py     # host memory and physics materials vs envs per simulator
+```
+
+Measured for the peg task: about 5.5 GB host memory per simulator plus 2.1 MB per env; 2 PhysX materials per env,
+so one simulator holds at most 32,767 envs.
+
+## Settings (`config.py`)
+
+| Setting | Meaning |
+|---|---|
+| `TASK`, `TASK_OVERRIDES` | Isaac Lab task id and Hydra overrides |
+| `ENVS_PER_GPU` | envs per simulator |
+| `NUM_WORKERS` | number of simulators |
+| `ROLLOUT_LEN` | steps per rollout sent to the learner |
+| `BANK_PAIR` | reset-data partition matching the task objects |
+| `STORAGE`, `RESULTS_DIR`, `CKPT_DIR` | shared paths for results, reset bank and checkpoints |
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `config.py` | all settings: task, envs per GPU, number of workers, paths, cost rates |
-| `sim_worker.py` | `SimWorker` Ray actor: boots Isaac Sim on its GPU, builds the env, runs rollouts, startup timers, GPU telemetry |
-| `learner.py` | `Learner` Ray actor: PPO update on rollouts from all workers, merges success-guided sampling counters, checkpoints |
-| `train_loop.py` | driver loop: starts workers in parallel, gathers rollouts with timeouts, rejoins restarted workers |
-| `bank_pipeline.py` | Ray Data pipeline that converts OmniReset reset states into per-worker parquet shards |
-| `scene_patches.py` | optional scene changes, e.g. one shared physics material per object |
-| `gpu_telemetry.py`, `common.py` | GPU sampling (`nvidia-smi dmon`), result files, run cost |
-| `cluster_env.py` | installs the stack on a node at runtime when the image does not have it (no-op on the image below) |
-| `image/` | Containerfile for an Anyscale image with the full stack (`make_containerfile.py` embeds the lockfile) |
+| `sim_worker.py` | simulator actor: Isaac Sim on its GPU, rollouts, startup timers, GPU telemetry |
+| `learner.py` | PPO learner actor: updates from all simulators, success-guided sampling, checkpoints |
+| `train_loop.py` | starts simulators in parallel, gathers rollouts, rejoins restarted simulators |
+| `bank_pipeline.py` | Ray Data pipeline for reset states |
+| `scene_patches.py` | optional scene changes, such as one shared physics material per object |
+| `gpu_telemetry.py`, `common.py` | GPU sampling, result files, run cost |
+| `cluster_env.py` | installs the stack on a node at runtime if the image lacks it |
+| `image/` | Containerfile and pinned package list |
 
-## Run
+![16 robots up close](docs/expert_peg_insertion.gif)
 
-```
-python check_gpus.py                     # one GPU task per node, placement check
-python build_reset_bank.py               # Ray Data: reset states -> per-worker shards
-python scale_training.py --smoke         # 2 workers x 1,024 envs, 3 iterations
-python scale_training.py --ws 1 2 4      # scaling at config.ENVS_PER_GPU envs per worker
-python fault_tolerance.py                # kill one worker mid-run, watch it restart and rejoin
-python learner_placement.py              # learner on its own GPU vs sharing a worker's GPU
-python one_gpu.py                        # one GPU: several simulators with MPS, and next-run setup during training
-python startup_and_memory.py             # host RAM and physics materials per env
-python memory_sweep.py                   # GPU memory and throughput vs envs per GPU
-python teardown.py                       # stop actors, check for leftover Isaac processes
-```
+## Credits
 
-Image: `cd image && python make_containerfile.py && anyscale image build -n omnireset-ray-sharded -f Containerfile.isaac`
-
-## Notes
-
-- Isaac Sim never runs on the driver; each actor uses `cuda:0` of the GPU Ray assigns to it.
-- One PhysX process allows 65,536 physics materials. The OmniReset peg task copies 2 per env, so one simulator holds
-  at most 32,767 envs; more simulators raise the total.
-- Host RAM: about 5.5 GB per simulator plus 2.1 MB per env.
-- MPS: `one_gpu.py` starts the MPS daemon on the node with a Ray task and stops it afterwards.
-- Source of the task, assets and policies: [OmniReset](https://arxiv.org/abs/2603.15789),
-  [UWLab](https://github.com/UW-Lab/UWLab), [uwlab-assets](https://huggingface.co/datasets/UW-Lab/uwlab-assets).
+Task, assets and policies: [OmniReset](https://arxiv.org/abs/2603.15789), [UWLab](https://github.com/UW-Lab/UWLab),
+[uwlab-assets](https://huggingface.co/datasets/UW-Lab/uwlab-assets). Built on [Isaac Lab](https://isaac-sim.github.io/IsaacLab/)
+and [Ray](https://docs.ray.io/).

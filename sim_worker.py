@@ -190,7 +190,8 @@ class SimWorker:
             leaf[frames[-1][:160]] += n
             for fr in set(frames):
                 incl[fr[:160]] += n
-        dst = os.path.join("/mnt/cluster_storage/demo_results/profiles", f"init_{self.num_envs}_{os.getpid()}.txt")
+        import config
+        dst = os.path.join(config.RESULTS_DIR, "profiles", f"init_{self.num_envs}_{os.getpid()}.txt")
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         subprocess.run(["cp", prof["out"], dst])
         return dict(cmd=prof["cmd"], samples=total, file=dst, top_self=leaf.most_common(40),
