@@ -4,7 +4,7 @@ Run Isaac Lab reinforcement learning across many GPUs with Ray. Each GPU runs it
 actor; one PPO learner trains on rollouts from all of them. Example task: OmniReset peg insertion
 (UR5e + Robotiq 2F-85).
 
-![98,304 robots inserting pegs on 6 GPUs](docs/expert_at_scale.gif)
+![16 robots, then 100, then 192,000 on 6 GPUs](docs/robots_zoom_out.gif)
 
 ## What it does
 
