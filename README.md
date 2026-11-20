@@ -39,6 +39,10 @@ python make_containerfile.py
 anyscale image build -n omnireset-ray-sharded -f Containerfile.isaac
 ```
 
+  The build takes a while: it installs Isaac Sim, Isaac Lab, UWLab and torch (many GB of packages), so expect
+  tens of minutes. `Containerfile.isaac` is self-contained (the pinned package list is embedded), so it can be
+  built on its own without the rest of the repo.
+
 - Shared storage at `/mnt/cluster_storage` (change `STORAGE` in `config.py` for another path).
 
 ## Quick start
