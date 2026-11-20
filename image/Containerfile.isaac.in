@@ -1,0 +1,73 @@
+# Anyscale image: Ray 2.60 + UWLab 2.0 (OmniReset) pinned stack, Python 3.12, headless, A100.
+#
+# GENERATED FILE SOURCE: edit Containerfile.isaac.in, then `python make_containerfile.py` -> Containerfile.isaac.
+#
+#   Isaac Sim 6.1.0.0 | Isaac Lab @ ae37b02 (3.0.0-EA, editable) | UW rsl_rl fork 5.4.1
+#   torch 2.11.0+cu128 | uwlab, uwlab_tasks, uwlab_rl, uwlab_assets @ UWLab 2b40afb (editable)
+#
+# Every Python package (incl. transitive deps) is installed from lockfile.txt: `uv pip freeze` of a
+# provisioned, healthy GPU node. Git SHAs alone do not pin transitive deps (urllib3 drift broke 2 nodes).
+# `anyscale image build` uploads only this file (no build context), so the lockfile is embedded below as
+# base64 and checked against its sha256.
+#
+# Build:  anyscale image build -n isaaclab-teacher-a100 -f Containerfile.isaac
+#
+# Why not Isaac Sim 4.5 / 5.x: Ray needs one Python minor cluster-wide and this base is py3.12;
+# Isaac Sim wheels are 4.5=cp310, 5.x=cp311, 6.x=cp312. UWLab 2.0 targets 6.1/py3.12 itself.
+#
+# Base tag follows Anyscale's anyscale/ray:<ray>-slim-py<py>-cu<cuda> scheme. If this exact tag is
+# not offered in your org, use `FROM anyscale/ray:2.60.0-py312-cu128` (non-slim).
+FROM anyscale/ray:2.60.0-slim-py312-cu128
+
+ARG UWLAB_COMMIT=2b40afb9693d46bc1b1a91c7ba95e03c04daa60d
+ARG ISAACLAB_COMMIT=ae37b028ea415c91ea2bc32609efcd759ed2b974
+
+# Headless Kit still loads GL/Vulkan/X client libs. cmake/build-essential for editable builds.
+RUN sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libglu1-mesa libgl1 libegl1 libvulkan1 libx11-6 libxt6 libxrandr2 libxi6 libxkbcommon0 \
+        libsm6 libice6 libgomp1 git cmake build-essential \
+    && sudo rm -rf /var/lib/apt/lists/*
+
+# NVIDIA Vulkan ICD (driver libs are injected by the container runtime at launch).
+RUN sudo mkdir -p /etc/vulkan/icd.d && echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libGLX_nvidia.so.0","api_version":"1.3"}}' \
+    | sudo tee /etc/vulkan/icd.d/nvidia_icd.json > /dev/null
+
+RUN command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH=/home/ray/.local/bin:$PATH
+
+# Sources at the pinned commits, at the exact paths the lockfile's editable (-e file://...) lines expect.
+RUN git init -q /home/ray/UWLab \
+    && git -C /home/ray/UWLab remote add origin https://github.com/UW-Lab/UWLab.git \
+    && git -C /home/ray/UWLab fetch -q --depth 1 origin ${UWLAB_COMMIT} \
+    && git -C /home/ray/UWLab checkout -q --detach FETCH_HEAD \
+    && git init -q /home/ray/UWLab/_isaaclab/IsaacLab \
+    && git -C /home/ray/UWLab/_isaaclab/IsaacLab remote add origin https://github.com/isaac-sim/IsaacLab.git \
+    && git -C /home/ray/UWLab/_isaaclab/IsaacLab fetch -q --depth 1 origin ${ISAACLAB_COMMIT} \
+    && git -C /home/ray/UWLab/_isaaclab/IsaacLab checkout -q --detach FETCH_HEAD
+
+# Embedded lockfile.txt (sha256 @@LOCK_SHA256@@).
+RUN echo '@@LOCK_B64@@' | base64 -d > /tmp/lockfile.txt \
+    && echo "@@LOCK_SHA256@@  /tmp/lockfile.txt" | sha256sum -c -
+
+# Exact environment from the lockfile. Indexes: NVIDIA (isaacsim*), PyTorch cu128 (torch +cu128), PyPI.
+RUN uv pip install --python "$(which python)" --no-cache -r /tmp/lockfile.txt \
+        --extra-index-url https://pypi.nvidia.com \
+        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        --index-strategy unsafe-best-match \
+    && cp /tmp/lockfile.txt /home/ray/lockfile.txt
+
+ENV OMNI_KIT_ACCEPT_EULA=YES \
+    ACCEPT_EULA=Y \
+    PRIVACY_CONSENT=Y \
+    OMNI_KIT_ALLOW_ROOT=1 \
+    NVIDIA_DRIVER_CAPABILITIES=all \
+    OMNI_KIT_CACHEDIR=/tmp/kit_cache
+
+# Build-time sanity (no GPU at build time, so no Kit boot): versions match the lock, task packages import,
+# and Ray itself still imports (catches the urllib3 hole).
+RUN python -c "import importlib.metadata as m, importlib.util as u, ray, urllib3; \
+print({p: m.version(p) for p in ('ray','isaacsim','torch','rsl-rl-lib','urllib3','numpy')}); \
+assert all(u.find_spec(x) for x in ('uwlab','uwlab_tasks','uwlab_rl','uwlab_assets','isaaclab','isaaclab_tasks')), 'task pkgs missing'" \
+    && uv pip freeze --python "$(which python)" | grep -v '^#' | sort > /tmp/installed.txt \
+    && grep -v '^#' /tmp/lockfile.txt | sort > /tmp/locked.txt \
+    && (comm -13 /tmp/installed.txt /tmp/locked.txt | tee /tmp/missing.txt; test ! -s /tmp/missing.txt)
