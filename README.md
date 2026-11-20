@@ -1,4 +1,4 @@
-# isaac-ray-scaling
+# omnireset-ray-sharded
 
 Isaac Lab simulation sharded across GPUs with Ray: one Isaac Sim process per GPU (a Ray actor), one PPO learner
 actor, reset states served from a Ray Data bank, per-reset-state success-guided sampling, and automatic restart of
@@ -47,7 +47,7 @@ python memory_sweep.py                   # GPU memory and throughput vs envs per
 python teardown.py                       # stop actors, check for leftover Isaac processes
 ```
 
-Image: `cd image && python make_containerfile.py && anyscale image build -n isaac-ray-scaling -f Containerfile.isaac`
+Image: `cd image && python make_containerfile.py && anyscale image build -n omnireset-ray-sharded -f Containerfile.isaac`
 
 ## Notes
 
