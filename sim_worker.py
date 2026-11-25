@@ -34,7 +34,8 @@ class SimWorker:
     def __init__(self, worker_id: int, num_envs: int, task: str, overrides: list, seed: int,
                  agent_entry: str = "rsl_rl_cfg_entry_point", reset_bank_path: str | None = None,
                  telemetry_interval_s: int = 2, bank_pair: str = "Peg__PegHole", num_workers: int = 1,
-                 cfg_patch: str | None = None, profile_init: bool = False):
+                 cfg_patch: str | None = None, profile_init: bool = False, physx_timers: bool = False,
+                 play_mode: bool = False, gdb_sample: str | None = None):
         t0 = time.time()
         self.worker_id, self.num_envs, self.task, self.seed = worker_id, num_envs, task, seed
         self.timings = {}
@@ -68,12 +69,16 @@ class SimWorker:
         self.timings["task_import_s"] = time.time() - t
 
         t = time.time()
+        self.is_isaaclab_preset_task = task.startswith("IsaacContrib-")
+        if self.is_isaaclab_preset_task:  # e.g. NIST: IsaacContrib-Factory-Franka + presets=peg_insert_4mm[,newton_mjwarp]
+            from isaaclab_tasks.utils.hydra import resolve_task_config
+            env_cfg, agent_cfg = resolve_task_config(task, agent_entry, play_mode=play_mode, overrides=list(overrides))
+        else:
+            @hydra_task_compose(task, agent_entry, list(overrides))
+            def _cfg(env_cfg, agent_cfg):
+                return env_cfg, agent_cfg
 
-        @hydra_task_compose(task, agent_entry, list(overrides))
-        def _cfg(env_cfg, agent_cfg):
-            return env_cfg, agent_cfg
-
-        env_cfg, agent_cfg = _cfg()
+            env_cfg, agent_cfg = _cfg()
         # adapt the agent cfg to the installed rsl-rl (UW fork 5.4.1), exactly as UWLab's play/train scripts do
         sys.path.insert(0, "/home/ray/UWLab/scripts/reinforcement_learning/rsl_rl")
         import cli_args
@@ -92,14 +97,24 @@ class SimWorker:
         self.bank = None
         if reset_bank_path:
             self._install_bank_reset(reset_bank_path, bank_pair, worker_id, num_workers)
-        else:
+        elif not self.is_isaaclab_preset_task:
             self._instrument_multireset()
         self._instrument_env_stages()
+        if physx_timers:  # split sim.reset (physics start) into PhysX sub-steps
+            import physx_stage_timers
+            physx_stage_timers.install(self.timings)
         self.profile = None
         prof = self._start_profiler() if profile_init else None
+        gdb_stop = None
+        if gdb_sample:  # native stack samples of gym.make (see physx_stage_timers.start_gdb_sampler)
+            import physx_stage_timers
+            gdb_stop = physx_stage_timers.start_gdb_sampler(gdb_sample)
+            self.timings["gdb_sampler_t0"] = time.time()
         t = time.time()
         self.env = gym.make(task, cfg=env_cfg)
         self.timings["gym_make_s"] = time.time() - t
+        if gdb_stop:
+            open(gdb_stop, "w").close()
         if prof:
             self.profile = self._stop_profiler(prof)
         reset_data_s = self.timings.get("mrm_total_s", self.timings.get("bank_load_s", 0.0))
@@ -262,6 +277,8 @@ class SimWorker:
     def set_sgs_weights(self, all_ids, all_w):
         """Learner broadcast: weights for every bank state of the pair; keep this worker's subset."""
         torch, b = self.torch, self.bank
+        if b is None or len(all_ids) == 0:  # task without our bank (e.g. NIST: its own Beta sampler does SGS)
+            return 0.0
         ids = torch.as_tensor(all_ids, device=self.device)
         w = torch.as_tensor(all_w, device=self.device, dtype=torch.float)
         pos = torch.searchsorted(ids, b.bank_ids)
@@ -308,11 +325,17 @@ class SimWorker:
         torch.cuda.synchronize()
         t = time.time()
         finished = []
+        tm = self.uenv.termination_manager
+        succ_term = "success" if (self.bank is None and "success" in tm.active_terms) else None
+        n_succ = n_ended = 0
         with torch.no_grad():
             for _ in range(self.L):
                 actions = self.alg.act(self.vobs)
                 obs, rew, dones, extras = self.venv.step(actions.to(self.venv.device))
                 obs, rew, dones = obs.to(self.device), rew.to(self.device), dones.to(self.device)
+                if succ_term:
+                    n_succ += int(tm.get_term(succ_term).sum())
+                    n_ended += int(dones.sum())
                 self.alg.process_env_step(obs, rew, dones, extras)
                 self.ep_ret += rew
                 d = dones.bool()
@@ -342,12 +365,25 @@ class SimWorker:
         if sm is not None:
             self._g_sm.set(sm, tags={"worker": str(self.worker_id)})
         buf["sgs"] = sgs
+        difficulty = monitored = None  # NIST: ADR difficulty level + the success rate the scheduler promotes on (>0.8)
+        try:
+            cm = self.uenv.curriculum_manager
+            if "difficulty_scheduler" in cm.active_terms:
+                term = cm.cfg.difficulty_scheduler
+                difficulty = float(term.func.current_adr_difficulties.float().mean())
+                cb = term.params.get("success_rate_callback")
+                if isinstance(cb, str):
+                    sr = eval(cb, {}, {"env": self.uenv})  # noqa: S307  (same expression the scheduler evaluates)
+                    monitored = None if sr is None else float(sr.float().mean())
+        except Exception as e:  # noqa: BLE001
+            monitored = f"{type(e).__name__}: {e}"[:120]
         stats = dict(worker_id=self.worker_id, weights_version=self.weights_version, envs=self.num_envs,
                      rollout_s=dt, env_steps_per_s=tput, episodes=int(len(fin)),
                      mean_ep_return=float(fin.mean()) if len(fin) else None,
-                     success=float(sgs["succ"].sum()) if sgs is not None else None,
-                     attempts=float(sgs["att"].sum()) if sgs is not None else None,
-                     sgs_delta_states=int(len(sgs["ids"])) if sgs is not None else 0,
+                     success=float(sgs["succ"].sum()) if sgs is not None else (float(n_succ) if succ_term else None),
+                     attempts=float(sgs["att"].sum()) if sgs is not None else (float(n_ended) if succ_term else None),
+                     sgs_delta_states=int(len(sgs["ids"])) if sgs is not None else 0, difficulty=difficulty,
+                     monitored_success=monitored,
                      buffer_mb=sum(v.nbytes for v in buf.values() if hasattr(v, "nbytes")) / 2**20)
         # The driver runs on a head node without numpy/torch: it only ever sees this small python dict plus an
         # ObjectRef to the buffer, which it hands to the learner (Ray moves it worker node -> learner node).
@@ -416,6 +452,43 @@ class SimWorker:
         ev.MultiResetManager.__init__ = init
 
     # ---------------- placement / health ----------------
+    def evaluate_ckpt(self, ckpt_path, n_steps: int, deterministic: bool = True):
+        """Success rate of a checkpoint (None = random actions) over ONE episode per env: fraction of envs whose
+        "success" termination fires before their first episode end. For NIST run with play_mode=True (eval resets:
+        full gravity, grasp_asset_in_air only, uniform sampling)."""
+        torch = self.torch
+        from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+        if not hasattr(self, "_eval_venv"):
+            self._eval_venv = RslRlVecEnvWrapper(self.env, clip_actions=self.agent_cfg.clip_actions)
+        venv = self._eval_venv
+        policy = None
+        if ckpt_path:
+            from rsl_rl.runners import OnPolicyRunner
+            runner = OnPolicyRunner(venv, self.agent_cfg.to_dict(), log_dir=None, device=str(self.device))
+            runner.load(ckpt_path)
+            policy = runner.get_inference_policy(device=str(self.device))
+        tm = self.uenv.termination_manager
+        self.env.reset()
+        obs = venv.get_observations()
+        ever = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        ended = torch.zeros_like(ever)
+        curve = []
+        t = time.time()
+        with torch.inference_mode():
+            for k in range(n_steps):
+                if policy is not None:
+                    a = policy(obs)
+                else:
+                    a = 2 * torch.rand(self.num_envs, self.act_dim, device=self.device) - 1
+                obs, _, dones, _ = venv.step(a)
+                s_now = tm.get_term("success").bool() & ~ended
+                ever |= s_now
+                ended |= dones.bool()
+                if k % 10 == 9:
+                    curve.append(float(ever.float().mean()))
+        return dict(ckpt=ckpt_path, success=float(ever.float().mean()), ended=float(ended.float().mean()),
+                    steps=n_steps, seconds=time.time() - t, curve=curve)
+
     def placement(self):
         import torch
         return dict(worker_id=self.worker_id, seed=self.seed, hostname=socket.gethostname(),

@@ -20,7 +20,11 @@ import time
 import ray
 from ray.exceptions import GetTimeoutError, RayActorError
 
+from ray.util.placement_group import placement_group, placement_group_table, remove_placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
 import config
+import mps
 from learner import Learner
 from sim_worker import SimWorker
 
@@ -44,18 +48,37 @@ def selector(extra_avoid=()):
 
 
 def run(tag, W, envs_per_worker, iterations, *, worker_gpu=1.0, learner_gpu=1.0, kill=None, init_ckpt=None,
-        meta=None, extra_avoid=(), post_rejoin_iters=None, worker_gpu_overrides=None):
+        meta=None, extra_avoid=(), post_rejoin_iters=None, worker_gpu_overrides=None, task=None, overrides=None,
+        use_bank=True, ckpt_every=None, cfg_patch=None, agent_overrides=None, sims_per_gpu=1):
     """kill: optional (worker_id, at_iteration). iterations is a cap when post_rejoin_iters is set: the run then
     stops that many iterations after the killed worker rejoins. worker_gpu_overrides: {worker_id: num_gpus}
-    (Phase 6: worker 0 at 0.5 so the learner at 0.5 packs onto the same GPU). Returns a dict of measurements."""
+    (Phase 6: worker 0 at 0.5 so the learner at 0.5 packs onto the same GPU). Returns a dict of measurements.
+    sims_per_gpu=k > 1: W simulators packed k per GPU with NVIDIA MPS. A placement group reserves W/k whole GPUs for the
+    simulators + 1 for the learner; simulator w gets 1/k of GPU w // k; MPS runs on every node of the group."""
     worker_gpu_overrides = worker_gpu_overrides or {}
     rejoined_at = None
     sel = selector(extra_avoid)
     tl = Timeline()
     L = config.ROLLOUT_LEN
     renv = {"env_vars": config.ISAAC_ENV_VARS}
+    pg, mps_nodes, sim_opts, learner_opts = None, [], lambda w: {}, {}
+    if sims_per_gpu > 1:
+        assert W % sims_per_gpu == 0, f"W={W} must be a multiple of sims_per_gpu={sims_per_gpu}"
+        n_gpus = W // sims_per_gpu
+        # 1 bundle per GPU (k simulators x 1 CPU each) + 1 for the learner
+        pg = placement_group([{"GPU": 1, "CPU": sims_per_gpu}] * n_gpus + [{"GPU": 1, "CPU": 1}], strategy="SPREAD")
+        ray.get(pg.ready(), timeout=1800)
+        mps_nodes = list(placement_group_table(pg)["bundles_to_node_id"].values())
+        started = mps.on_nodes("start", mps_nodes)
+        print(f"  MPS on {len(set(mps_nodes))} node(s): {sum(1 for r in started.values() if r['procs'])} daemons up")
+        renv = {"env_vars": dict(config.ISAAC_ENV_VARS, **mps.MPS_ENV)}
+        worker_gpu, learner_gpu = 1.0 / sims_per_gpu, 1.0
+        sim_opts = lambda w: dict(num_cpus=1, scheduling_strategy=PlacementGroupSchedulingStrategy(  # noqa: E731
+            pg, placement_group_bundle_index=w // sims_per_gpu))
+        learner_opts = dict(num_cpus=1, runtime_env=renv,
+                            scheduling_strategy=PlacementGroupSchedulingStrategy(pg, placement_group_bundle_index=n_gpus))
     print(f"\n=== {tag}: W={W} x {envs_per_worker:,} envs = {W*envs_per_worker:,} envs | L={L} | "
-          f"worker_gpu={worker_gpu} learner_gpu={learner_gpu}")
+          f"worker_gpu={worker_gpu} learner_gpu={learner_gpu} sims_per_gpu={sims_per_gpu}")
 
     # ---- workers: parallel init ----
     t_create = time.time()
@@ -64,10 +87,12 @@ def run(tag, W, envs_per_worker, iterations, *, worker_gpu=1.0, learner_gpu=1.0,
         seed = config.worker_seed(w)
         if meta is not None:
             meta.note_seed(w, seed)
+        opts = sim_opts(w) or dict(label_selector=sel)
         workers[w] = SimWorker.options(
-            name=f"{tag}_w{w}", num_gpus=worker_gpu_overrides.get(w, worker_gpu), label_selector=sel, runtime_env=renv,
-        ).remote(w, envs_per_worker, config.TASK, config.TASK_OVERRIDES, seed, config.AGENT_ENTRY,
-                 config.BANK_DIR, config.TELEMETRY_INTERVAL_S, config.BANK_PAIR, W)
+            name=f"{tag}_w{w}", num_gpus=worker_gpu_overrides.get(w, worker_gpu), runtime_env=renv, **opts,
+        ).remote(w, envs_per_worker, task or config.TASK, overrides if overrides is not None else config.TASK_OVERRIDES,
+                 seed, config.AGENT_ENTRY, config.BANK_DIR if use_bank else None, config.TELEMETRY_INTERVAL_S,
+                 config.BANK_PAIR, W, cfg_patch)
     pend = {workers[w].ping.remote(): w for w in workers}
     ready_at = {}
     while pend:
@@ -86,11 +111,19 @@ def run(tag, W, envs_per_worker, iterations, *, worker_gpu=1.0, learner_gpu=1.0,
     # ---- training setup ----
     specs = ray.get([workers[w].setup_training.remote(L) for w in workers], timeout=600)
     agent_cfg = ray.get(workers[0].agent_cfg_dict.remote(), timeout=60)
+    for dotted, val in (agent_overrides or {}).items():  # e.g. {"algorithm.num_mini_batches": 32}
+        d = agent_cfg
+        *path, last = dotted.split(".")
+        for k in path:
+            d = d[k]
+        print(f"  agent cfg override {dotted}: {d.get(last)} -> {val}")
+        d[last] = val
     t = time.time()
-    learner = Learner.options(name=f"{tag}_learner", num_gpus=learner_gpu, label_selector=sel).remote(
+    learner = Learner.options(name=f"{tag}_learner", num_gpus=learner_gpu,
+                              **(learner_opts or dict(label_selector=sel))).remote(
         agent_cfg, specs[0]["obs_dim"], specs[0]["num_actions"], envs_per_worker, L,
-        (config.BANK_DIR, config.BANK_PAIR), f"{config.CKPT_DIR}/{tag}", config.SEED,
-        config.SGS_EVERY, config.CKPT_EVERY, init_ckpt, False)
+        (config.BANK_DIR, config.BANK_PAIR) if use_bank else [], f"{config.CKPT_DIR}/{tag}", config.SEED,
+        config.SGS_EVERY, ckpt_every or config.CKPT_EVERY, init_ckpt, False)
     linfo = ray.get(learner.info.remote(), timeout=600)
     learner_init_s = time.time() - t
     placement.append(dict(worker_id="learner", hostname=linfo["hostname"], node_id=linfo["node_id"],
@@ -171,13 +204,21 @@ def run(tag, W, envs_per_worker, iterations, *, worker_gpu=1.0, learner_gpu=1.0,
                    buffer_mb=sum(b["buffer_mb"] for b in bstats), learner=rec,
                    episodes=sum(b["episodes"] for b in bstats),
                    success=sum(b["success"] or 0 for b in bstats), attempts=sum(b["attempts"] or 0 for b in bstats),
-                   mean_ep_return=_mean([b["mean_ep_return"] for b in bstats]))
+                   mean_ep_return=_mean([b["mean_ep_return"] for b in bstats]),
+                   difficulty=_mean([b.get("difficulty") for b in bstats]),
+                   monitored_success=_mean([b.get("monitored_success") for b in bstats
+                                            if isinstance(b.get("monitored_success"), float)]),
+                   monitored_err=next((b.get("monitored_success") for b in bstats
+                                       if isinstance(b.get("monitored_success"), str)), None))
         iters.append(row)
         sr = row["success"] / row["attempts"] if row["attempts"] else float("nan")
         print(f"  it {it:3d} | {len(got)}/{W} workers | {row['agg_env_steps_per_s']:>10,.0f} env-steps/s | "
               f"wall {it_wall:5.1f}s (learner update {rec['update_s']:.2f}s, ingest {rec['ingest_s']:.2f}s, "
               f"sgs {1e3*rec['sgs_merge_s']:.1f}ms) | buf {row['buffer_mb']:.0f} MB | succ {sr:.3f} "
-              f"| ret {row['mean_ep_return'] if row['mean_ep_return'] is None else round(row['mean_ep_return'], 2)}",
+              f"| ret {row['mean_ep_return'] if row['mean_ep_return'] is None else round(row['mean_ep_return'], 2)}"
+              + (f" | difficulty {row['difficulty']:.2f}" if row.get("difficulty") is not None else "")
+              + (f" | monitored {row['monitored_success']:.3f}" if row.get("monitored_success") is not None else "")
+              + (f" | mon_err {row['monitored_err']}" if row.get("monitored_err") else ""),
               flush=True)
         # rejoin restarted workers (non-blocking)
         for w, (pref, t_dead) in list(dead_since.items()):
@@ -217,8 +258,11 @@ def run(tag, W, envs_per_worker, iterations, *, worker_gpu=1.0, learner_gpu=1.0,
     ray.wait(closes, num_returns=len(closes), timeout=120)
     for h in list(workers.values()) + [learner]:
         ray.kill(h, no_restart=True)
+    if pg is not None:
+        mps.on_nodes("stop", mps_nodes)
+        remove_placement_group(pg)
     return dict(tag=tag, W=W, envs_per_worker=envs_per_worker, total_envs=W * envs_per_worker, L=L,
-                worker_gpu=worker_gpu, learner_gpu=learner_gpu, placement=placement,
+                worker_gpu=worker_gpu, learner_gpu=learner_gpu, sims_per_gpu=sims_per_gpu, placement=placement,
                 init_wall_s=init_wall, init_each_s=init_each, init_ready_at_s=ready_at, timings_each=timings_each,
                 learner_init_s=learner_init_s, iterations=iters, loop_wall_s=loop_wall, timeline=tl.events,
                 sgs=sgs_final,

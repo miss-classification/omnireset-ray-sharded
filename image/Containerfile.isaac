@@ -50,7 +50,7 @@ RUN echo 'IyB1diBwaXAgZnJlZXplIGZyb20gcHJvdmlzaW9uZWQgR1BVIG5vZGUgb24gMjAyNi0xMS
     && echo "0f9c3995ac9931a45b9491f373668dc10854995b2aef33a1fe4413fe2893d94d  /tmp/lockfile.txt" | sha256sum -c -
 
 # Exact environment from the lockfile. Indexes: NVIDIA (isaacsim*), PyTorch cu128 (torch +cu128), PyPI.
-RUN uv pip install --python "$(which python)" --no-cache -r /tmp/lockfile.txt \
+RUN uv pip install --python "$(which python)" --no-cache --no-deps -r /tmp/lockfile.txt \
         --extra-index-url https://pypi.nvidia.com \
         --extra-index-url https://download.pytorch.org/whl/cu128 \
         --index-strategy unsafe-best-match \

@@ -187,7 +187,10 @@ def load_worker_shard(bank_dir, pair, worker_id, num_workers, device="cuda:0"):
     import torch
 
     t0 = time.time()
-    shards = [s for s in range(NUM_SHARDS) if s % num_workers == worker_id]
+    if num_workers <= NUM_SHARDS:
+        shards = [s for s in range(NUM_SHARDS) if s % num_workers == worker_id]
+    else:  # more simulators than shards (e.g. 4 per GPU on 8 GPUs): simulators share shards
+        shards = [worker_id % NUM_SHARDS]
     files = [f for s in shards for f in glob.glob(os.path.join(bank_dir, f"pair={pair}", f"shard={s}", "*.parquet"))]
     tbl = pq.read_table(files, columns=["reset_state_id", "type_idx"] + column_names()) if files else None
     t_read = time.time() - t0

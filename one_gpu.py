@@ -1,4 +1,4 @@
-"""Single GPU: two ways to cut startup on one GPU, run concurrently on two nodes.
+"""One GPU: two ways to win on a single GPU, run concurrently on two nodes.
 
 mps      k simulators x N/k envs share one GPU with NVIDIA MPS on (concurrent kernels across processes). Phase 10
          without MPS: startup 2.5x faster but stepping 0.45x (time-sliced contexts). Does MPS recover stepping?
@@ -17,33 +17,20 @@ import ray
 
 import config
 from common import RunMeta, write_json
+from mps import MPS_ENV, mps
 from sim_worker import SimWorker
 
-MPS_ENV = {"CUDA_MPS_PIPE_DIRECTORY": "/tmp/nvidia-mps-pipe", "CUDA_MPS_LOG_DIRECTORY": "/tmp/nvidia-mps-log"}
-
-
-@ray.remote(num_cpus=0)
-def mps(cmd):
-    import os
-    import subprocess
-    env = dict(os.environ, **MPS_ENV)
-    for d in MPS_ENV.values():
-        os.makedirs(d, exist_ok=True)
-    if cmd == "start":
-        r = subprocess.run(["nvidia-cuda-mps-control", "-d"], env=env, capture_output=True, text=True)
-    else:
-        r = subprocess.run(["nvidia-cuda-mps-control"], input="quit\n", env=env, capture_output=True, text=True)
-    time.sleep(2)
-    ps = subprocess.run("pgrep -a nvidia-cuda-mps", shell=True, capture_output=True, text=True).stdout
-    return dict(rc=r.returncode, out=(r.stdout + r.stderr)[-300:], procs=ps.strip())
+PATCH = None
+TASK, OVERRIDES, EXTRA_ENV, USE_BANK = None, None, {}, True
 
 
 def worker(name, wid, n, k, node, frac, extra_env=None):
-    env = dict(config.ISAAC_ENV_VARS, **(extra_env or {}))
+    env = dict(config.ISAAC_ENV_VARS, **EXTRA_ENV, **(extra_env or {}))
     return SimWorker.options(name=name, num_gpus=frac, max_restarts=0, label_selector={"ray.io/node-id": node},
                              runtime_env={"env_vars": env}) \
-        .remote(wid, n, config.TASK, config.TASK_OVERRIDES, config.worker_seed(wid), config.AGENT_ENTRY,
-                config.BANK_DIR, config.TELEMETRY_INTERVAL_S, config.BANK_PAIR, k)
+        .remote(wid, n, TASK or config.TASK, OVERRIDES if OVERRIDES is not None else config.TASK_OVERRIDES,
+                config.worker_seed(wid), config.AGENT_ENTRY, config.BANK_DIR if USE_BANK else None,
+                config.TELEMETRY_INTERVAL_S, config.BANK_PAIR, k, PATCH)
 
 
 def close(ws):
@@ -59,7 +46,7 @@ def run_mps(node, total, k):
     rec = dict(name=f"mps_{k}x{total // k}", node=node, ok=False)
     rec["mps_start"] = ray.get(mps.options(label_selector={"ray.io/node-id": node}).remote("start"), timeout=120)
     t0 = time.time()
-    ws = [worker(f"p11mps_{i}", i, total // k, k, node, 1.0 / k, MPS_ENV) for i in range(k)]
+    ws = [worker(f"p11mps_{k}_{i}_{node[:4]}", i, total // k, k, node, 1.0 / k, MPS_ENV) for i in range(k)]
     try:
         ray.get([w.ping.remote() for w in ws], timeout=3600)
         rec["init_wall_s"] = time.time() - t0
@@ -126,23 +113,38 @@ def run_overlap(node, n, chunk=20):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--envs", type=int, default=16384)
-    ap.add_argument("--k", type=int, default=4)
+    ap.add_argument("--k", type=int, nargs="+", default=[4], help="one MPS run per k, each on its own free node")
+    ap.add_argument("--patch", default=None, help="scene_patches function applied in every simulator")
+    ap.add_argument("--out", default="one_gpu.json")
+    ap.add_argument("--task", default=None, help="e.g. IsaacContrib-Factory-Franka (NIST); default config.TASK")
+    ap.add_argument("--overrides", nargs="*", default=None, help="e.g. presets=peg_insert_4mm,newton_mjwarp")
+    ap.add_argument("--env", nargs="*", default=[], help="extra env vars KEY=VALUE for every simulator")
     ap.add_argument("--only", choices=["mps", "overlap"], default=None)
     args = ap.parse_args()
     ray.init(address=config.RAY_ADDRESS)
+    global PATCH, TASK, OVERRIDES, USE_BANK
+    PATCH, TASK, OVERRIDES = args.patch, args.task, args.overrides
+    USE_BANK = args.task is None or args.task == config.TASK
+    EXTRA_ENV.update(dict(kv.split("=", 1) for kv in args.env))
     meta = RunMeta("phase11")
     bad = set(n["NodeID"] for n in ray.nodes() if any(n["NodeID"].startswith(p) for p in config.EXCLUDE_NODE_ID_PREFIXES))
-    nodes = [n["NodeID"] for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0) >= 1 and n["NodeID"] not in bad]
+    from ray._private.state import state as _st
+    free = {nid for nid, r in _st.available_resources_per_node().items() if r.get("GPU", 0) >= 1}
+    nodes = [n["NodeID"] for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0) >= 1 and n["NodeID"] not in bad
+             and n["NodeID"] in free]
+    print(f"free GPU nodes: {[x[:8] for x in nodes]}")
     jobs = {}
     if args.only in (None, "mps"):
-        jobs["mps"] = lambda: run_mps(nodes[0], args.envs, args.k)
+        for i, k in enumerate(args.k):
+            jobs[f"mps_k{k}"] = (lambda k=k, nd=nodes[i]: run_mps(nd, args.envs, k))
     if args.only in (None, "overlap"):
-        jobs["overlap"] = lambda: run_overlap(nodes[-1], args.envs)  # with one GPU node, run --only mps / --only overlap separately
+        # with one free GPU node, run --only mps / --only overlap separately
+        jobs["overlap"] = lambda: run_overlap(nodes[min(len(args.k), len(nodes) - 1)], args.envs)
     with cf.ThreadPoolExecutor(len(jobs)) as ex:
         futs = {k: ex.submit(f) for k, f in jobs.items()}
         res = {k: f.result() for k, f in futs.items()}
-    if "mps" in res:
-        r = res["mps"]
+    for key in [k for k in res if k.startswith("mps")]:
+        r = res[key]
         print(f"\nMPS {r['name']}: ok={r['ok']} startup {r.get('init_wall_s', 0):.0f}s  agg {r.get('agg_env_steps_per_s', 0):,.0f} "
               f"env-steps/s  VRAM {r.get('gpu_used_mib', 0) / 1024:.1f} GiB  physics start {r.get('physics_start_s')}  "
               f"SM% {r.get('sm_pct_step')}  daemon {r['mps_start'].get('procs')!r} {r.get('error', '')[:300]}")
@@ -156,7 +158,7 @@ def main():
     out = dict(meta=meta.finish(gpu_nodes_used=len(jobs)), results=res)
     m = out["meta"]
     print(f"wall {m['wall_s']/60:.1f} min | est. ${m['usd_used_nodes']:.2f} | ${m['usd_whole_cluster']:.2f} whole cluster")
-    write_json("one_gpu.json", out)
+    write_json(args.out, out)
 
 
 if __name__ == "__main__":
