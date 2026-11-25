@@ -66,8 +66,12 @@ def ensure_stack(log=print):
                 # 5. converge on lockfile.txt (uv pip freeze of a healthy node; same file the image installs).
                 #    Pins every transitive dep, incl. urllib3, which Ray workers import at startup
                 #    (ray -> requests -> urllib3); an interrupted urllib3 swap left 2 nodes unable to start workers.
-                lock = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lockfile.txt")
-                _run([UV, "pip", "install", "--python", sys.executable, "-r", lock,
+                here = os.path.dirname(os.path.abspath(__file__))
+                lock = next(p for p in (os.path.join(here, "lockfile.txt"), os.path.join(here, "image", "lockfile.txt"))
+                            if os.path.exists(p))
+                # --no-deps: the lock is a full freeze; re-resolving it fails (google-api-core 2.44 vs requests 2.32.3
+                # as frozen on the original node).
+                _run([UV, "pip", "install", "--python", sys.executable, "--no-deps", "-r", lock,
                       "--extra-index-url", "https://pypi.nvidia.com",
                       "--extra-index-url", "https://download.pytorch.org/whl/cu128",
                       "--index-strategy", "unsafe-best-match"], env=env, log=log)

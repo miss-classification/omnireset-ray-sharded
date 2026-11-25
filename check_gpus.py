@@ -54,7 +54,6 @@ def probe(i: int):
         has_isaacsim=has("isaacsim"),
         has_isaaclab=has("isaaclab"),
         has_torch=has("torch"),
-        isaaclab_dir_exists=os.path.isdir(config.ISAACLAB_DIR),
         omni_kit_cachedir=os.environ.get("OMNI_KIT_CACHEDIR"),
         eula_vars={k: v for k, v in os.environ.items() if "EULA" in k.upper()},
         cluster_storage_ok=os.path.isdir(config.STORAGE),
@@ -115,7 +114,7 @@ def main():
     print(f"\nwall {wall:.1f}s | concurrent overlap {overlap:.1f}s | {len(nodes)} distinct GPU node(s) | head nodes excluded: {len(heads)}")
 
     # ---- environment on GPU nodes (informational, gates Phase 1) ----
-    env_keys = ["python", "pip", "has_isaacsim", "has_isaaclab", "has_torch", "isaaclab_dir_exists",
+    env_keys = ["python", "pip", "has_isaacsim", "has_isaaclab", "has_torch",
                 "omni_kit_cachedir", "eula_vars", "cluster_storage_ok"]
     envs = {json.dumps({k: r[k] for k in env_keys}, sort_keys=True) for r in res}
     print(f"\nGPU-node software environment ({len(envs)} distinct variant(s)):")
